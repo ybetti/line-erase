@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageTk
 import pymupdf
 import os
-from skimage.morphology import skeletonize
+from skeleton import skeletonize
 
 
 class LineEditor:
@@ -35,7 +35,7 @@ class LineEditor:
         self.current_page = 0
         self.total_pages = 0
         self.pdf_path = None
-        self.dpi = 200
+        self.dpi = 100
 
         # View
         self.zoom = 1.0
@@ -105,14 +105,15 @@ class LineEditor:
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         tk.Label(toolbar, text=" DPI:").pack(side=tk.LEFT)
-        self.dpi_var = tk.IntVar(value=200)
+        self.dpi_var = tk.IntVar(value=100)
         tk.Spinbox(toolbar, from_=72, to=600, textvariable=self.dpi_var, width=4).pack(side=tk.LEFT, padx=2)
 
         # Status
         status_bar = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="PDFファイルを開いてください")
-        tk.Label(status_bar, textvariable=self.status_var, anchor=tk.W).pack(fill=tk.X)
+        tk.Label(status_bar, textvariable=self.status_var, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(status_bar, text="ホイール:上下  Shift+ホイール:左右  Ctrl+ホイール:ズーム", fg="gray50", anchor=tk.E).pack(side=tk.RIGHT)
 
         # Canvas
         self.canvas = tk.Canvas(self.root, bg="#888888", cursor="crosshair")
@@ -138,19 +139,37 @@ class LineEditor:
 
     def open_pdf(self):
         path = filedialog.askopenfilename(
-            title="PDFファイルを選択",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            title="ファイルを選択",
+            filetypes=[("PDF/画像", "*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")],
             initialdir=r"C:\Users\sealake\Desktop\東部支店図面\図面_PDF"
         )
         if not path:
             return
         self.pdf_path = path
-        self.pdf_doc = pymupdf.open(path)
-        self.total_pages = len(self.pdf_doc)
-        self.current_page = 0
-        self.undo_stack.clear()
-        self._load_page(0)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'):
+            self.pdf_doc = None
+            self.total_pages = 1
+            self.current_page = 0
+            self.image_path = path
+            self.undo_stack.clear()
+            self._load_image(path)
+        else:
+            self.pdf_doc = pymupdf.open(path)
+            self.image_path = None
+            self.total_pages = len(self.pdf_doc)
+            self.current_page = 0
+            self.undo_stack.clear()
+            self._load_page(0)
         self.root.title(f"図面線抽出エディタ - {os.path.basename(path)}")
+
+    def _load_image(self, path):
+        """Load an image file directly."""
+        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            self.status_var.set("画像の読み込みに失敗しました")
+            return
+        self._process_gray(img)
 
     def _load_page(self, page_num):
         if not self.pdf_doc:
@@ -170,77 +189,60 @@ class LineEditor:
             gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
         else:
             gray = img_array
+        self._process_gray(gray)
 
+    def _process_gray(self, gray):
         self.original_img = gray.copy()
-        _, raw_bin = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        _, self.source_bin = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-        # Remove text/numbers (small connected components)
-        n_raw, lbl_raw, stats_raw, _ = cv2.connectedComponentsWithStats(raw_bin, connectivity=8)
-        cleaned = np.zeros_like(raw_bin)
-        for i in range(1, n_raw):
-            area = stats_raw[i, cv2.CC_STAT_AREA]
-            w = stats_raw[i, cv2.CC_STAT_WIDTH]
-            h = stats_raw[i, cv2.CC_STAT_HEIGHT]
-            if area < 80:
-                continue
-            if area < 300:
-                aspect = max(w, h) / (min(w, h) + 1)
-                if aspect < 5:
-                    continue
-            cleaned[lbl_raw == i] = 255
-        self.source_bin = cleaned
-
-        self.status_var.set(f"ページ {page_num + 1} 骨格線を計算中...")
+        self.status_var.set("骨格線を計算中...")
         self.root.update()
 
-        # Skeletonize
-        skel = skeletonize(cleaned > 0).astype(np.uint8)
+        skel = skeletonize(self.source_bin > 0).astype(np.uint8)
 
-        # Find junction points: skeleton pixels with 3+ skeleton neighbors
-        # Use convolution to count neighbors
         kernel = np.array([[1, 1, 1],
                            [1, 0, 1],
                            [1, 1, 1]], dtype=np.uint8)
         neighbor_count = cv2.filter2D(skel, cv2.CV_16S, kernel)
-        junctions = (skel > 0) & (neighbor_count >= 3)
+        junctions = (skel > 0) & (neighbor_count >= 5)
 
-        # Dilate junctions slightly to ensure clean separation
-        junction_dilated = cv2.dilate(junctions.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1)
+        skel_f = skel.astype(np.float32)
+        corners = cv2.cornerHarris(skel_f, blockSize=5, ksize=3, k=0.04)
+        corner_mask = (skel > 0) & (corners > 0.01 * corners.max())
 
-        # Remove junctions from skeleton to get separated segments
+        split_points = junctions | corner_mask
+        split_dilated = split_points.astype(np.uint8)
+
         skel_no_junc = skel.copy()
-        skel_no_junc[junction_dilated > 0] = 0
+        skel_no_junc[split_dilated > 0] = 0
 
-        # Label skeleton segments
         n_seg, skel_labels = cv2.connectedComponents(skel_no_junc, connectivity=8)
 
-        self.status_var.set(f"ページ {page_num + 1} セグメントを拡張中...")
+        self.status_var.set("セグメントを拡張中...")
         self.root.update()
 
-        # Expand skeleton labels to full line width using iterative dilation within source_bin
         expanded = skel_labels.copy()
-        remaining = (cleaned == 255) & (expanded == 0)
+        remaining = (self.source_bin == 255) & (expanded == 0)
         k3 = np.ones((3, 3), np.uint8)
-        for _ in range(15):  # Enough iterations to cover max line width
+        for _ in range(15):
             if not np.any(remaining):
                 break
             dilated = cv2.dilate(expanded.astype(np.float64), k3, iterations=1).astype(np.int32)
             assign = remaining & (dilated > 0)
             expanded[assign] = dilated[assign]
-            remaining = (cleaned == 255) & (expanded == 0)
+            remaining = (self.source_bin == 255) & (expanded == 0)
 
         self.segment_labels = expanded
         self.num_segments = n_seg
 
-        # Start with all selected
         self.seg_selected = np.ones(n_seg, dtype=bool)
-        self.seg_selected[0] = False  # Background
+        self.seg_selected[0] = False
         self._rebuild_work_img()
 
         self.undo_stack.clear()
-        self.page_var.set(f"{page_num + 1} / {self.total_pages}")
+        self.page_var.set(f"{self.current_page + 1} / {self.total_pages}")
         self.status_var.set(
-            f"ページ {page_num + 1} 読み込み完了 — {n_seg - 1} セグメント  "
+            f"読み込み完了 — {n_seg - 1} セグメント  "
             f"クリックで線セグメントを除去/抽出できます"
         )
         self.zoom_fit()
@@ -267,7 +269,7 @@ class LineEditor:
 
         disp = np.full((h, w, 3), 255, dtype=np.uint8)
         unselected_ink = (self.source_bin == 255) & (self.work_img == 0)
-        disp[unselected_ink] = [210, 210, 210]
+        disp[unselected_ink] = [255, 255, 255]
         disp[self.work_img == 255] = [0, 0, 0]
 
         new_w = max(1, int(w * self.zoom))
@@ -363,10 +365,19 @@ class LineEditor:
         self.drag_start = None
 
     def _on_mousewheel(self, event):
-        if event.delta > 0:
-            self.zoom_in()
-        else:
-            self.zoom_out()
+        if event.state & 0x0004:  # Ctrl = zoom
+            if event.delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+        elif event.state & 0x0001:  # Shift = horizontal scroll
+            scroll = int(event.delta / 120) * 30
+            self.pan_x += scroll
+            self._update_display()
+        else:  # Vertical scroll
+            scroll = int(event.delta / 120) * 30
+            self.pan_y += scroll
+            self._update_display()
 
     # ========== Click Segment ==========
 
@@ -376,7 +387,7 @@ class LineEditor:
         if ix is None:
             return 0
         h, w = self.source_bin.shape
-        search_r = max(5, int(5 / self.zoom))
+        search_r = max(10, int(10 / self.zoom))
         best_label = 0
         best_dist = float('inf')
         for dy in range(-search_r, search_r + 1):
@@ -505,15 +516,15 @@ class LineEditor:
             return
         path = filedialog.asksaveasfilename(
             title="画像を保存",
-            defaultextension=".png",
-            filetypes=[("PNG files", "*.png")],
+            defaultextension=".jpg",
+            filetypes=[("JPEG files", "*.jpg")],
             initialdir=r"C:\Users\sealake\Desktop\extracted_lines",
-            initialfile=f"page_{self.current_page + 1:02d}.png"
+            initialfile=f"page_{self.current_page + 1:02d}.jpg"
         )
         if not path:
             return
         output = 255 - self.work_img
-        success, buf = cv2.imencode('.png', output)
+        success, buf = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 95])
         if success:
             with open(path, 'wb') as f:
                 f.write(buf)
