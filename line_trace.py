@@ -190,6 +190,20 @@ class LineTrace:
         tk.Button(row3, text="+", command=self.zoom_in, width=2).pack(side=tk.LEFT)
         tk.Button(row3, text="全体", command=self.zoom_fit, width=4).pack(side=tk.LEFT, padx=2)
 
+        # Pan direction buttons (cross layout, right-aligned, grid)
+        pan_step = 80
+        btn_w, btn_h = 3, 1
+        pan_frame = tk.Frame(row3)
+        pan_frame.pack(side=tk.RIGHT, padx=4)
+        tk.Button(pan_frame, text="↑", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(0, pan_step)).grid(row=0, column=1)
+        tk.Button(pan_frame, text="←", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(pan_step, 0)).grid(row=1, column=0)
+        tk.Button(pan_frame, text="↓", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(0, -pan_step)).grid(row=1, column=1)
+        tk.Button(pan_frame, text="→", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(-pan_step, 0)).grid(row=1, column=2)
+
         # Status
         status_bar = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -992,6 +1006,11 @@ class LineTrace:
 
     def _on_middle_release(self, event):
         self.drag_start = None
+
+    def _pan_by(self, dx, dy):
+        self.pan_x += dx
+        self.pan_y += dy
+        self._update_display()
 
     def _on_mousewheel(self, event):
         if event.state & 0x0004:  # Ctrl = zoom

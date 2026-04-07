@@ -14,6 +14,7 @@ from PIL import Image, ImageTk
 import pymupdf
 import os
 import math
+import time
 
 
 class LineEraser:
@@ -33,7 +34,7 @@ class LineEraser:
         self.current_page = 0
         self.total_pages = 0
         self.pdf_path = None
-        self.dpi = 150
+        self.dpi = 200
 
         # View
         self.zoom = 1.0
@@ -65,13 +66,19 @@ class LineEraser:
         # Arrow placement state
         self.arrow_start = None  # (img_x, img_y) of first click
 
-        # Move state
+        # Move / selection state
         self.moving_idx = None       # Index of stamp being moved
         self.move_offset = (0, 0)    # Offset from stamp center to grab point
         self.move_arrow_end = False  # Moving arrow endpoint vs startpoint
+        self.selected_idx = -1       # Currently selected stamp index
 
         # Pan
         self.drag_start = None
+
+        # Display cache for fast erasing
+        self._disp_cache = None      # Pre-built BGR image (full size, no stamps)
+        self._disp_cache_valid = False
+        self._last_draw_time = 0     # For throttling display updates
 
         # Undo
         self.undo_stack = []
@@ -122,6 +129,7 @@ class LineEraser:
         modes_after = [
             ("矢印", "arrow"),
             ("移動", "move"),
+            ("図形削除", "delete_stamp"),
         ]
         for text, val in modes_after:
             tk.Radiobutton(row1, text=text, variable=self.mode_var, value=val,
@@ -149,7 +157,7 @@ class LineEraser:
 
         self.show_bg_var = tk.BooleanVar(value=False)
         tk.Checkbutton(row1, text="原図表示", variable=self.show_bg_var,
-                       command=self._update_display).pack(side=tk.LEFT, padx=4)
+                       command=self._on_bg_toggle).pack(side=tk.LEFT, padx=4)
 
         ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
 
@@ -166,7 +174,7 @@ class LineEraser:
         ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
 
         tk.Label(row1, text=" DPI:").pack(side=tk.LEFT)
-        self.dpi_var = tk.IntVar(value=150)
+        self.dpi_var = tk.IntVar(value=200)
         tk.Spinbox(row1, from_=72, to=600, textvariable=self.dpi_var, width=4).pack(side=tk.LEFT, padx=2)
 
         # === Row 2: Stamp settings ===
@@ -187,7 +195,6 @@ class LineEraser:
         ttk.Separator(row2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
 
         # Delete selected stamp
-        tk.Button(row2, text="選択図形削除", command=self.delete_selected_stamp, width=10).pack(side=tk.LEFT, padx=2)
         tk.Button(row2, text="全図形削除", command=self.delete_all_stamps, width=8).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(row2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
@@ -196,18 +203,19 @@ class LineEraser:
         self.arrow_hint_var = tk.StringVar(value="")
         tk.Label(row2, textvariable=self.arrow_hint_var, fg="blue").pack(side=tk.LEFT, padx=4)
 
-        # Pan direction buttons (right side)
+        # Pan direction buttons (cross layout, right-aligned, grid)
+        pan_step = 80
+        btn_w, btn_h = 3, 1
         pan_frame = tk.Frame(row2)
         pan_frame.pack(side=tk.RIGHT, padx=4)
-        pan_step = 80
-        tk.Button(pan_frame, text="←", width=2,
-                  command=lambda: self._pan_by(pan_step, 0)).pack(side=tk.LEFT)
-        tk.Button(pan_frame, text="↑", width=2,
-                  command=lambda: self._pan_by(0, pan_step)).pack(side=tk.LEFT)
-        tk.Button(pan_frame, text="↓", width=2,
-                  command=lambda: self._pan_by(0, -pan_step)).pack(side=tk.LEFT)
-        tk.Button(pan_frame, text="→", width=2,
-                  command=lambda: self._pan_by(-pan_step, 0)).pack(side=tk.LEFT)
+        tk.Button(pan_frame, text="↑", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(0, pan_step)).grid(row=0, column=1)
+        tk.Button(pan_frame, text="←", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(pan_step, 0)).grid(row=1, column=0)
+        tk.Button(pan_frame, text="↓", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(0, -pan_step)).grid(row=1, column=1)
+        tk.Button(pan_frame, text="→", width=btn_w, height=btn_h,
+                  command=lambda: self._pan_by(-pan_step, 0)).grid(row=1, column=2)
 
         # Status bar
         status_bar = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
@@ -235,6 +243,10 @@ class LineEraser:
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Control-s>", lambda e: self.save_current())
         self.root.bind("<Delete>", lambda e: self.delete_selected_stamp())
+
+    def _on_bg_toggle(self):
+        self._disp_cache_valid = False
+        self._update_display()
 
     def _mode_changed(self):
         self.mode = self.mode_var.get()
@@ -333,6 +345,7 @@ class LineEraser:
     def _rebuild_work_img(self):
         self.work_img = self.source_bin.copy()
         self.work_img[self.erase_mask] = 0
+        self._disp_cache_valid = False
 
     # ========== Page Navigation ==========
 
@@ -359,29 +372,35 @@ class LineEraser:
         cy = img_top + iy * self.zoom
         return cx, cy
 
-    def _update_display(self):
-        if self.source_bin is None:
-            return
+    def _build_disp_base(self):
+        """Build the base display image (cached)."""
         h, w = self.source_bin.shape
-
         if self.show_bg_var.get() and self.original_img is not None:
             bg = np.clip(self.original_img.astype(np.int16) + 100, 0, 255).astype(np.uint8)
             bg = np.maximum(bg, 200)
             disp = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
         else:
             disp = np.full((h, w, 3), 255, dtype=np.uint8)
-
         disp[self.work_img == 255] = [0, 0, 0]
+        self._disp_cache = disp
+        self._disp_cache_valid = True
+
+    def _update_display(self, fast=False):
+        if self.source_bin is None:
+            return
+        h, w = self.source_bin.shape
+
+        if not self._disp_cache_valid or self._disp_cache is None:
+            self._build_disp_base()
+
+        disp = self._disp_cache.copy()
 
         # Draw stamps onto the image
         self._draw_stamps_on_img(disp)
 
         new_w = max(1, int(w * self.zoom))
         new_h = max(1, int(h * self.zoom))
-        if self.zoom < 1.0:
-            resized = cv2.resize(disp, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            resized = cv2.resize(disp, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        resized = cv2.resize(disp, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
         resized_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(resized_rgb)
@@ -399,10 +418,36 @@ class LineEraser:
         # Draw arrow preview if placing
         self._draw_arrow_preview()
 
+    def _update_erase_region(self, ix, iy, r):
+        """Incrementally update the display cache in the erased region."""
+        if self._disp_cache is None or not self._disp_cache_valid:
+            return
+        h, w = self.source_bin.shape
+        y0 = max(0, iy - r)
+        y1 = min(h, iy + r + 1)
+        x0 = max(0, ix - r)
+        x1 = min(w, ix + r + 1)
+        # Update cache: erased pixels become white (background)
+        if self.show_bg_var.get() and self.original_img is not None:
+            bg_region = self.original_img[y0:y1, x0:x1].astype(np.int16)
+            bg_region = np.clip(bg_region + 100, 0, 255).astype(np.uint8)
+            bg_region = np.maximum(bg_region, 200)
+            erased = self.erase_mask[y0:y1, x0:x1] & (self.source_bin[y0:y1, x0:x1] == 255)
+            for c in range(3):
+                ch = self._disp_cache[y0:y1, x0:x1, c]
+                ch[erased] = bg_region[erased]
+        else:
+            erased = self.erase_mask[y0:y1, x0:x1] & (self.source_bin[y0:y1, x0:x1] == 255)
+            self._disp_cache[y0:y1, x0:x1][erased] = [255, 255, 255]
+
     def _draw_stamps_on_img(self, disp):
         """Render all stamps onto the BGR display image."""
         for i, st in enumerate(self.stamps):
-            color = (0, 0, 0)  # BGR: black
+            # Selected stamp is highlighted in red
+            if i == self.selected_idx:
+                color = (0, 0, 255)  # BGR: red
+            else:
+                color = (0, 0, 0)  # BGR: black
             lw = max(1, int(self.stamp_size * 0.15))
 
             if st["type"] == "cross":
@@ -502,6 +547,8 @@ class LineEraser:
         region_ink = self.source_bin[y0:y1, x0:x1] == 255
         self.erase_mask[y0:y1, x0:x1] |= region_ink
         self.work_img[y0:y1, x0:x1][region_ink & self.erase_mask[y0:y1, x0:x1]] = 0
+        # Incrementally update display cache
+        self._update_erase_region(ix, iy, r)
 
     def _erase_line(self, cx0, cy0, cx1, cy1):
         dist = max(abs(cx1 - cx0), abs(cy1 - cy0))
@@ -616,12 +663,17 @@ class LineEraser:
             self.status_var.set(f"矢印を配置しました ({x1},{y1})→({ix},{iy})")
 
     def delete_selected_stamp(self):
-        """Delete the last placed stamp (or use move mode to pick one)."""
+        """Delete the selected stamp, or the last one if none selected."""
         if not self.stamps:
             self.status_var.set("図形がありません")
             return
         self._push_undo()
-        removed = self.stamps.pop()
+        if 0 <= self.selected_idx < len(self.stamps):
+            removed = self.stamps.pop(self.selected_idx)
+            self.selected_idx = -1
+        else:
+            removed = self.stamps.pop()
+        self._disp_cache_valid = False
         self._update_display()
         self.status_var.set(f"{removed['type']}図形を削除しました")
 
@@ -644,8 +696,11 @@ class LineEraser:
             self.erasing = True
             self._push_undo()
             self.stroke_points = [(event.x, event.y)]
+            # Ensure cache is ready before starting stroke
+            if not self._disp_cache_valid or self._disp_cache is None:
+                self._build_disp_base()
             self._erase_at(event.x, event.y)
-            self._update_display()
+            self._update_display(fast=True)
             self._draw_cursor_rect(event.x, event.y)
 
         elif self.mode == "rect":
@@ -660,6 +715,21 @@ class LineEraser:
         elif self.mode == "arrow":
             self._place_arrow_click(event.x, event.y)
 
+        elif self.mode == "delete_stamp":
+            ix, iy = self._canvas_to_img(event.x, event.y)
+            if ix is None:
+                return
+            idx = self._find_stamp_at(ix, iy)
+            if idx >= 0:
+                self._push_undo()
+                removed = self.stamps.pop(idx)
+                self.selected_idx = -1
+                self._disp_cache_valid = False
+                self._update_display()
+                self.status_var.set(f"{removed['type']}図形を削除しました")
+            else:
+                self.status_var.set("近くに図形がありません")
+
         elif self.mode == "move":
             ix, iy = self._canvas_to_img(event.x, event.y)
             if ix is None:
@@ -668,6 +738,7 @@ class LineEraser:
             if idx >= 0:
                 self._push_undo()
                 self.moving_idx = idx
+                self.selected_idx = idx
                 st = self.stamps[idx]
                 if st["type"] in ("cross", "number"):
                     self.move_offset = (ix - st["x"], iy - st["y"])
@@ -691,6 +762,7 @@ class LineEraser:
                 self.status_var.set(f"図形を移動中...")
             else:
                 self.moving_idx = None
+                self.selected_idx = -1
                 self.status_var.set("近くに図形がありません")
 
     def _on_left_drag(self, event):
@@ -706,8 +778,12 @@ class LineEraser:
             else:
                 self._erase_at(event.x, event.y)
             self.stroke_points.append((event.x, event.y))
-            self._update_display()
-            self._draw_cursor_rect(event.x, event.y)
+            # Throttle: skip display if too frequent
+            now = time.time()
+            if now - self._last_draw_time > 0.03:  # ~30fps max
+                self._update_display(fast=True)
+                self._draw_cursor_rect(event.x, event.y)
+                self._last_draw_time = now
 
         elif self.mode == "rect":
             if self.rect_start is None:
@@ -759,9 +835,10 @@ class LineEraser:
             if self.erasing and self.stroke_points:
                 px, py = self.stroke_points[-1]
                 self._erase_line(px, py, event.x, event.y)
-                self._update_display()
             self.erasing = False
             self.stroke_points = []
+            # Final high-quality redraw
+            self._update_display(fast=False)
             erased = int(np.sum(self.erase_mask))
             total_ink = int(np.sum(self.source_bin == 255))
             self.status_var.set(f"消去済み: {erased:,} / {total_ink:,} ピクセル")
